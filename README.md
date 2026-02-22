@@ -1,0 +1,1 @@
+# ghostty-mission-control
