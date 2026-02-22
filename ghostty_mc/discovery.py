@@ -35,6 +35,7 @@ class TerminalSession:
     claude_session_id: Optional[str] = None
     window_index: Optional[int] = None
     window_title: Optional[str] = None
+    custom_name: str = ""
 
 
 def _run(cmd: list[str], timeout: int = 5) -> str:
