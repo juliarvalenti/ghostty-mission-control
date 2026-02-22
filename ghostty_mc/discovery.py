@@ -13,7 +13,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# Matches cloud/remote session IDs like session_01HKb1vQuPyz4rqgyrD51XMP
 SESSION_ID_RE = re.compile(r"session_[0-9a-zA-Z]{10,40}")
+# Matches local UUID-style session IDs like b4be5e28-17b6-412d-9fd2-fd27dc499bfe
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SHELLS = {"zsh", "bash", "fish", "sh", "tcsh", "csh", "dash", "ksh", "-zsh", "-bash", "-fish", "-sh"}
 HOME = str(Path.home())
 
@@ -152,9 +155,14 @@ def _detect_claude_code(
     for pid in descendants:
         info = processes.get(pid, {})
         comm = info.get("comm", "").lower()
-        # Direct match: process is called 'claude' or contains it
+        # Direct match: process is called 'claude' or 'environment-manager'
         if "claude" in comm:
             claude_pids.append(pid)
+        elif comm == "environment-manager":
+            # environment-manager with --session flag is a Claude Code companion
+            args = _get_process_args(pid)
+            if "--session" in args:
+                claude_pids.append(pid)
         # Node.js process that might be Claude Code
         elif comm == "node":
             args = _get_process_args(pid)
@@ -190,56 +198,85 @@ def _search_claude_state_files(cwd: str) -> Optional[str]:
     """
     Search for Claude Code session ID in state files.
 
-    Checks:
-    - ~/.claude/projects/<hash>/ for state files
-    - <cwd>/.claude/ for local state
+    Claude Code stores session transcripts at:
+        ~/.claude/projects/<encoded-path>/<UUID>.jsonl
+
+    The path encoding replaces '/' with '-', so /home/user/myapp
+    becomes -home-user-myapp.
+
+    For active sessions, we find the most recently modified .jsonl
+    file and return its UUID as the session identifier.
     """
-    # Expand ~ back to full path for file access
     full_cwd = cwd.replace("~", HOME, 1) if cwd.startswith("~") else cwd
 
-    # Check project-local .claude directory
-    local_claude = os.path.join(full_cwd, ".claude")
-    if os.path.isdir(local_claude):
-        session_id = _scan_dir_for_session_id(local_claude)
+    # Encode the CWD path the way Claude Code does: replace / with -
+    encoded_path = full_cwd.replace("/", "-")
+    project_dir = os.path.join(HOME, ".claude", "projects", encoded_path)
+
+    if os.path.isdir(project_dir):
+        session_id = _find_latest_session_in_dir(project_dir)
         if session_id:
             return session_id
 
-    # Check ~/.claude/projects/ for matching project state
-    global_projects = os.path.join(HOME, ".claude", "projects")
-    if os.path.isdir(global_projects):
-        try:
-            for entry in os.listdir(global_projects):
-                project_dir = os.path.join(global_projects, entry)
-                if os.path.isdir(project_dir):
-                    session_id = _scan_dir_for_session_id(project_dir)
-                    if session_id:
-                        return session_id
-        except OSError:
-            pass
+    # Also check sessions-index.json if it exists
+    index_file = os.path.join(project_dir, "sessions-index.json")
+    if os.path.isfile(index_file):
+        session_id = _parse_sessions_index(index_file)
+        if session_id:
+            return session_id
 
     return None
 
 
-def _scan_dir_for_session_id(directory: str) -> Optional[str]:
-    """Scan files in a directory for a session ID pattern."""
+def _find_latest_session_in_dir(directory: str) -> Optional[str]:
+    """
+    Find the most recently modified .jsonl session transcript
+    and return its UUID filename as the session ID.
+    """
     try:
+        jsonl_files = []
         for entry in os.listdir(directory):
-            filepath = os.path.join(directory, entry)
-            if not os.path.isfile(filepath):
-                continue
-            # Only check small text files
-            try:
-                size = os.path.getsize(filepath)
-                if size > 100_000:  # Skip files > 100KB
+            if entry.endswith(".jsonl"):
+                filepath = os.path.join(directory, entry)
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    jsonl_files.append((mtime, entry))
+                except OSError:
                     continue
-                with open(filepath, "r", errors="ignore") as f:
-                    content = f.read(10_000)
-                match = SESSION_ID_RE.search(content)
+
+        if not jsonl_files:
+            return None
+
+        # Most recently modified transcript is likely the active session
+        jsonl_files.sort(reverse=True)
+        latest = jsonl_files[0][1]
+        # The filename without .jsonl is the session UUID
+        uuid = latest.removesuffix(".jsonl")
+        if UUID_RE.fullmatch(uuid):
+            return uuid
+    except OSError:
+        pass
+    return None
+
+
+def _parse_sessions_index(index_file: str) -> Optional[str]:
+    """Parse sessions-index.json for the most recent session ID."""
+    import json
+
+    try:
+        with open(index_file, "r") as f:
+            data = json.load(f)
+        # sessions-index.json may be a dict or list of session metadata
+        if isinstance(data, dict):
+            # Try to find the most recent session
+            for key in data:
+                match = UUID_RE.search(key)
                 if match:
                     return match.group(0)
-            except OSError:
-                continue
-    except OSError:
+                match = SESSION_ID_RE.search(str(data[key]))
+                if match:
+                    return match.group(0)
+    except (OSError, json.JSONDecodeError, TypeError):
         pass
     return None
 
