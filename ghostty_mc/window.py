@@ -1,9 +1,11 @@
 """
 macOS window management for Ghostty.
 
-Uses AppleScript (via osascript) and the Accessibility API to
-enumerate Ghostty windows, match them to terminal sessions,
-and raise specific windows to the front.
+Uses multiple strategies to enumerate and raise Ghostty windows:
+1. Ghostty's native AppleScript dictionary (community project / App Intents)
+   - Exposes terminal index, UUID, title, working directory
+2. System Events GUI scripting (fallback)
+   - Enumerates windows by title, raises via AXRaise
 """
 
 import os
@@ -29,11 +31,78 @@ def _osascript(script: str, timeout: int = 5) -> str:
 
 def get_ghostty_windows() -> list[dict]:
     """
-    Enumerate Ghostty windows via AppleScript.
+    Enumerate Ghostty windows/terminals.
+
+    Tries Ghostty's native AppleScript dictionary first (available with
+    the ghostty-applescript community project or Ghostty 1.2+ App Intents).
+    Falls back to System Events GUI scripting.
 
     Returns a list of dicts with keys:
-        - index: 1-based window index (for AppleScript)
-        - title: window title string
+        - index: 1-based terminal/window index
+        - title: window/terminal title
+        - cwd: working directory (only from native API, else None)
+    """
+    # Strategy 1: Try Ghostty's native AppleScript (richer data)
+    windows = _get_windows_native()
+    if windows:
+        return windows
+
+    # Strategy 2: Fall back to System Events
+    return _get_windows_system_events()
+
+
+def _get_windows_native() -> list[dict]:
+    """
+    Try to enumerate terminals via Ghostty's native AppleScript dictionary.
+
+    The ghostty-applescript community project (github.com/kkilchrist/ghostty-applescript)
+    exposes terminal objects with index, title, and working directory.
+    """
+    script = """\
+try
+    tell application "Ghostty"
+        set output to ""
+        set termList to every terminal
+        repeat with t in termList
+            set tIdx to index of t
+            set tTitle to title of t
+            set tDir to working directory of t
+            set output to output & tIdx & "|||" & tTitle & "|||" & tDir & linefeed
+        end repeat
+        return output
+    end tell
+on error
+    return ""
+end try"""
+    output = _osascript(script, timeout=10)
+    if not output:
+        return []
+
+    windows = []
+    for line in output.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|||")
+        if len(parts) < 2:
+            continue
+        try:
+            idx = int(parts[0])
+        except ValueError:
+            continue
+        title = parts[1] if len(parts) > 1 else ""
+        cwd = parts[2] if len(parts) > 2 else None
+        windows.append({"index": idx, "title": title, "cwd": cwd})
+
+    return windows
+
+
+def _get_windows_system_events() -> list[dict]:
+    """
+    Enumerate Ghostty windows via System Events GUI scripting.
+
+    This is the fallback when the native AppleScript dictionary is not
+    available. Only provides window index and title.
     """
     script = """\
 tell application "System Events"
@@ -59,7 +128,11 @@ end tell"""
             continue
         idx_str, title = line.split("|||", 1)
         try:
-            windows.append({"index": int(idx_str), "title": title})
+            windows.append({
+                "index": int(idx_str),
+                "title": title,
+                "cwd": None,
+            })
         except ValueError:
             continue
 
@@ -70,14 +143,64 @@ def match_sessions_to_windows(
     sessions: list[TerminalSession], windows: list[dict]
 ) -> None:
     """
-    Match terminal sessions to Ghostty windows by comparing
-    CWD and foreground process names with window titles.
+    Match terminal sessions to Ghostty windows.
+
+    If windows have CWD info (from native API), matches by exact CWD.
+    Otherwise falls back to heuristic title matching.
 
     Modifies sessions in-place, setting window_index and window_title.
     """
     if not windows:
         return
 
+    has_cwd = any(w.get("cwd") for w in windows)
+
+    if has_cwd:
+        _match_by_cwd(sessions, windows)
+    else:
+        _match_by_title(sessions, windows)
+
+
+def _match_by_cwd(
+    sessions: list[TerminalSession], windows: list[dict]
+) -> None:
+    """Match sessions to windows using working directory (exact match)."""
+    used_indices: set[int] = set()
+
+    for session in sessions:
+        for i, window in enumerate(windows):
+            if i in used_indices:
+                continue
+            win_cwd = window.get("cwd", "")
+            if not win_cwd:
+                continue
+            # Normalize for comparison: both might use ~ or full path
+            if _cwds_match(session.cwd, win_cwd):
+                session.window_index = window["index"]
+                session.window_title = window["title"]
+                used_indices.add(i)
+                break
+
+    # Assign remaining unmatched by title heuristic
+    unmatched = [s for s in sessions if s.window_index is None]
+    remaining = [w for i, w in enumerate(windows) if i not in used_indices]
+    if unmatched and remaining:
+        _match_by_title(unmatched, remaining)
+
+
+def _cwds_match(cwd1: str, cwd2: str) -> bool:
+    """Check if two CWD strings refer to the same directory."""
+    home = os.path.expanduser("~")
+    # Normalize both to full paths
+    p1 = cwd1.replace("~", home, 1) if cwd1.startswith("~") else cwd1
+    p2 = cwd2.replace("~", home, 1) if cwd2.startswith("~") else cwd2
+    return p1.rstrip("/") == p2.rstrip("/")
+
+
+def _match_by_title(
+    sessions: list[TerminalSession], windows: list[dict]
+) -> None:
+    """Match sessions to windows using title heuristics."""
     used_indices: set[int] = set()
 
     for session in sessions:
@@ -100,13 +223,11 @@ def match_sessions_to_windows(
             session.window_title = windows[best_match]["title"]
             used_indices.add(best_match)
 
-    # For unmatched sessions, try a looser fallback: assign remaining
-    # windows in order (better than nothing)
+    # For still-unmatched sessions, assign remaining windows in order
     unmatched_sessions = [s for s in sessions if s.window_index is None]
     unmatched_windows = [
         w for i, w in enumerate(windows) if i not in used_indices
     ]
-
     for session, window in zip(unmatched_sessions, unmatched_windows):
         session.window_index = window["index"]
         session.window_title = window["title"]
@@ -115,7 +236,6 @@ def match_sessions_to_windows(
 def _match_score(session: TerminalSession, title: str) -> int:
     """
     Score how well a session matches a window title.
-
     Higher score = better match.
     """
     score = 0
@@ -147,16 +267,30 @@ def raise_ghostty_window(window_index: Optional[int] = None) -> bool:
     """
     Raise a specific Ghostty window to the front.
 
+    Tries Ghostty's native 'focus terminal' first, then falls back
+    to AXRaise via System Events.
+
     Args:
-        window_index: 1-based AppleScript window index.
+        window_index: 1-based terminal/window index.
             If None, just activates the Ghostty application.
 
     Returns:
         True if the operation succeeded.
     """
     if window_index is not None:
-        # Raise the specific window, then activate the app
-        script = f"""\
+        # Strategy 1: Try native Ghostty focus command
+        native_script = f"""\
+try
+    tell application "Ghostty" to focus terminal {window_index}
+    return "ok"
+on error
+    return "fallback"
+end try"""
+        result = _osascript(native_script, timeout=5)
+
+        if result != "ok":
+            # Strategy 2: Fall back to AXRaise via System Events
+            fallback_script = f"""\
 tell application "System Events"
     tell process "Ghostty"
         perform action "AXRaise" of window {window_index}
@@ -164,10 +298,8 @@ tell application "System Events"
     end tell
 end tell
 tell application "Ghostty" to activate"""
+            _osascript(fallback_script, timeout=5)
     else:
-        # Just activate Ghostty (brings frontmost window forward)
-        script = 'tell application "Ghostty" to activate'
+        _osascript('tell application "Ghostty" to activate', timeout=5)
 
-    output = _osascript(script, timeout=5)
-    # osascript returns empty on success for these commands
     return True
